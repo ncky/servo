@@ -282,6 +282,10 @@ impl IntersectionObserver {
             .add_rendering_update_reason(
                 RenderingUpdateReason::IntersectionObserverStartedObservingTarget,
             );
+        target
+            .owner_window()
+            .script_thread()
+            .set_needs_rendering_update();
     }
 
     /// <https://w3c.github.io/IntersectionObserver/#unobserve-target-element>
