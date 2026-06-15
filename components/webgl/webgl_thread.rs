@@ -318,6 +318,52 @@ impl WebGLThread {
         }
     }
 
+    fn cleanup_all_webgl_contexts(&mut self, reason: &str) {
+        let context_ids: Vec<WebGLContextId> = self.contexts.keys().copied().collect();
+        if !context_ids.is_empty() {
+            warn!(
+                "Cleaning up {} WebGL contexts during {reason}",
+                context_ids.len()
+            );
+        }
+        for context_id in context_ids {
+            self.destroy_webgl_context_now(context_id, reason);
+        }
+    }
+
+    fn destroy_webgl_context_now(&mut self, context_id: WebGLContextId, reason: &str) {
+        self.busy_webgl_context_map.write().remove(&context_id);
+
+        if let Some(image_key) = self
+            .cached_context_info
+            .remove(&context_id)
+            .and_then(|info| info.image_key)
+        {
+            self.paint_api.delete_image(image_key);
+        }
+
+        let Some(mut data) = self.contexts.remove(&context_id) else {
+            return;
+        };
+
+        if let Err(err) =
+            self.webrender_swap_chains
+                .destroy(context_id, &data.device, &mut data.ctx)
+        {
+            warn!(
+                "Failed to destroy WebGL swap chain during {reason}: {:?}",
+                err
+            );
+        }
+
+        if let Err(err) = data.device.destroy_context(&mut data.ctx) {
+            warn!("Failed to destroy WebGL context during {reason}: {:?}", err);
+            std::mem::forget(data.ctx);
+        }
+
+        self.bound_context_id = None;
+    }
+
     /// Handles a generic WebGLMsg message
     fn handle_msg(&mut self, msg: WebGLMsg, webgl_chan: &WebGLChan) -> bool {
         trace!("processing {:?}", msg);
@@ -393,10 +439,7 @@ impl WebGLThread {
             },
             WebGLMsg::Exit(sender) => {
                 // Call remove_context functions in order to correctly delete WebRender image keys.
-                let context_ids: Vec<WebGLContextId> = self.contexts.keys().copied().collect();
-                for id in context_ids {
-                    self.remove_webgl_context(id);
-                }
+                self.cleanup_all_webgl_contexts("WebGLMsg::Exit");
 
                 if let Err(e) = sender.send(()) {
                     warn!("Failed to send response to WebGLMsg::Exit ({e})");
@@ -888,21 +931,7 @@ impl WebGLThread {
             self.webxr_bridge = webxr_bridge;
         }
 
-        // Release GL context.
-        let Some(mut data) = self.contexts.remove(&context_id) else {
-            return;
-        };
-
-        // Destroy the swap chains
-        self.webrender_swap_chains
-            .destroy(context_id, &data.device, &mut data.ctx)
-            .unwrap();
-
-        // Destroy the context
-        data.device.destroy_context(&mut data.ctx).unwrap();
-
-        // Removing a GLContext may make the current bound context_id dirty.
-        self.bound_context_id = None;
+        self.destroy_webgl_context_now(context_id, "RemoveContext");
     }
 
     fn handle_swap_buffers(
@@ -1106,6 +1135,14 @@ impl WebGLThread {
             external_image_data,
             false,
         );
+    }
+}
+
+impl Drop for WebGLThread {
+    fn drop(&mut self) {
+        if !self.contexts.is_empty() {
+            self.cleanup_all_webgl_contexts("WebGLThread drop");
+        }
     }
 }
 
