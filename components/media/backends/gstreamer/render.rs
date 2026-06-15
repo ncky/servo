@@ -2,13 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use glib::prelude::*;
 use servo_media_gstreamer_render::Render;
 use servo_media_player::PlayerError;
 use servo_media_player::context::PlayerGLContext;
 use servo_media_player::video::{Buffer, VideoFrame, VideoFrameData};
+
+fn raydex_gl_video_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RAYDEX_SERVO_GL_VIDEO").is_some())
+}
 
 #[cfg(any(
     target_os = "linux",
@@ -97,8 +102,18 @@ pub struct GStreamerRender {
 
 impl GStreamerRender {
     pub fn new(gl_context: Box<dyn PlayerGLContext>) -> Self {
+        // The GStreamer GLMemory path currently presents video frames upside-down
+        // through this embedder's WebRender bridge. Keep browser rendering on the
+        // OpenGL/WebRender path, but upload decoded media frames as raw BGRA by
+        // default until the external texture origin is fixed end-to-end.
+        let render = if raydex_gl_video_enabled() {
+            platform::create_render(gl_context)
+        } else {
+            None
+        };
+
         GStreamerRender {
-            render: platform::create_render(gl_context),
+            render,
         }
     }
 

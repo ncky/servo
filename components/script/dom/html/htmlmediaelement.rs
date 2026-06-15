@@ -5,7 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use std::{f64, mem};
 
@@ -65,7 +65,7 @@ use crate::dom::bindings::codegen::Bindings::TextTrackBinding::{TextTrackKind, T
 use crate::dom::bindings::codegen::Bindings::URLBinding::URLMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
 use crate::dom::bindings::codegen::UnionTypes::{
-    MediaStreamOrBlob, VideoTrackOrAudioTrackOrTextTrack,
+    BlobOrMediaSource, MediaStreamOrBlobOrMediaSource, VideoTrackOrAudioTrackOrTextTrack,
 };
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
@@ -90,6 +90,7 @@ use crate::dom::html::htmlvideoelement::HTMLVideoElement;
 use crate::dom::mediaerror::MediaError;
 use crate::dom::mediafragmentparser::MediaFragmentParser;
 use crate::dom::medialist::MediaList;
+use crate::dom::mediasource::MediaSource;
 use crate::dom::mediastream::MediaStream;
 use crate::dom::node::{Node, NodeDamage, NodeTraits, UnbindContext};
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
@@ -115,6 +116,11 @@ static MEDIA_CONTROL_CSS: &str = include_str!("../../resources/media-controls.cs
 
 /// A JS file to control the media controls.
 static MEDIA_CONTROL_JS: &str = include_str!("../../resources/media-controls.js");
+
+fn raydex_trace_mse_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RAYDEX_SERVO_TRACE_MSE").is_some())
+}
 
 /// The media engine may report a seek-done position that differs slightly from the
 /// requested position (e.g. snapping to the nearest keyframe), so we use a threshold
@@ -455,14 +461,18 @@ impl VideoFrameRenderer for MediaFrameRenderer {
 enum SrcObject {
     MediaStream(Dom<MediaStream>),
     Blob(Dom<Blob>),
+    MediaSource(Dom<MediaSource>),
 }
 
-impl From<MediaStreamOrBlob> for SrcObject {
-    fn from(src_object: MediaStreamOrBlob) -> SrcObject {
+impl From<MediaStreamOrBlobOrMediaSource> for SrcObject {
+    fn from(src_object: MediaStreamOrBlobOrMediaSource) -> SrcObject {
         match src_object {
-            MediaStreamOrBlob::Blob(blob) => SrcObject::Blob(Dom::from_ref(&*blob)),
-            MediaStreamOrBlob::MediaStream(stream) => {
+            MediaStreamOrBlobOrMediaSource::Blob(blob) => SrcObject::Blob(Dom::from_ref(&*blob)),
+            MediaStreamOrBlobOrMediaSource::MediaStream(stream) => {
                 SrcObject::MediaStream(Dom::from_ref(&*stream))
+            },
+            MediaStreamOrBlobOrMediaSource::MediaSource(media_source) => {
+                SrcObject::MediaSource(Dom::from_ref(&*media_source))
             },
         }
     }
@@ -595,6 +605,9 @@ pub(crate) struct HTMLMediaElement {
     next_timeupdate_event: Cell<Instant>,
     /// Latest fetch request context.
     current_fetch_context: RefCell<Option<HTMLMediaElementFetchContext>>,
+    #[ignore_malloc_size_of = "MSE byte queue"]
+    #[no_trace]
+    mse_data_source: RefCell<BufferedDataSource>,
     /// Media controls id.
     /// In order to workaround the lack of privileged JS context, we secure the
     /// the access to the "privileged" document.servoGetMediaControls(id) API by
@@ -682,6 +695,7 @@ impl HTMLMediaElement {
             text_tracks_list: Default::default(),
             next_timeupdate_event: Cell::new(Instant::now() + Duration::from_millis(250)),
             current_fetch_context: RefCell::new(None),
+            mse_data_source: RefCell::new(BufferedDataSource::new()),
             media_controls_id: DomRefCell::new(None),
         }
     }
@@ -730,6 +744,10 @@ impl HTMLMediaElement {
                     error!("Could not pause player: {error:?}");
                 }
             }
+        }
+
+        if self.has_media_source_object() {
+            self.process_mse_data_queue(/* lock_after_enough */ false);
         }
     }
 
@@ -931,6 +949,15 @@ impl HTMLMediaElement {
     fn change_ready_state(&self, ready_state: ReadyState) {
         let old_ready_state = self.ready_state.get();
         self.ready_state.set(ready_state);
+
+        if raydex_trace_mse_enabled() {
+            eprintln!(
+                "Raydex Servo MSE: ready state changed {:?} -> {:?} network={:?}",
+                old_ready_state,
+                ready_state,
+                self.network_state.get() as u8,
+            );
+        }
 
         if self.network_state.get() == NetworkState::Empty {
             return;
@@ -1186,6 +1213,13 @@ impl HTMLMediaElement {
         // Step 9.attribute.3. If urlRecord is not failure, then set the currentSrc
         // attribute to the result of applying the URL serializer to urlRecord.
         *self.current_src.borrow_mut() = url_record.as_str().into();
+
+        if let Some(media_source) = self.global().get_media_source_object_url(&url_record) {
+            *self.src_object.borrow_mut() =
+                Some(SrcObject::MediaSource(Dom::from_ref(&*media_source)));
+            self.resource_fetch_algorithm(Resource::Object);
+            return;
+        }
 
         // Step 9.attribute.5. If urlRecord is not failure, then run the resource fetch
         // algorithm with urlRecord. If that algorithm returns without aborting this one,
@@ -1568,10 +1602,18 @@ impl HTMLMediaElement {
                 if let Some(ref src_object) = *self.src_object.borrow() {
                     match src_object {
                         SrcObject::Blob(blob) => {
-                            let blob_url = URL::CreateObjectURL(&self.global(), blob);
+                            let blob_url = URL::CreateObjectURL(
+                                &self.global(),
+                                BlobOrMediaSource::Blob(DomRoot::from_ref(blob)),
+                            );
                             *self.blob_url.borrow_mut() =
                                 Some(ServoUrl::parse(&blob_url.str()).expect("infallible"));
                             self.fetch_request(None, None);
+                        },
+                        SrcObject::MediaSource(media_source) => {
+                            self.reset_mse_data_source();
+                            media_source.attach_to_element(self);
+                            self.network_state.set(NetworkState::Idle);
                         },
                         SrcObject::MediaStream(stream) => {
                             let tracks = &*stream.get_tracks();
@@ -1724,6 +1766,7 @@ impl HTMLMediaElement {
 
         // Reset the media player for any previously playing media resource (see Step 11).
         self.reset_media_player();
+        self.reset_mse_data_source();
 
         // Step 7. If the media element's networkState is not set to NETWORK_EMPTY, then:
         if network_state != NetworkState::Empty {
@@ -2214,6 +2257,54 @@ impl HTMLMediaElement {
         }
     }
 
+    fn has_media_source_object(&self) -> bool {
+        matches!(*self.src_object.borrow(), Some(SrcObject::MediaSource(_)))
+    }
+
+    fn reset_mse_data_source(&self) {
+        self.mse_data_source.borrow_mut().reset();
+    }
+
+    fn process_mse_data_queue(&self, lock_after_enough: bool) {
+        let Some(player) = self.player.borrow().as_ref().cloned() else {
+            return;
+        };
+
+        let result = {
+            let mut data_source = self.mse_data_source.borrow_mut();
+            data_source.set_locked(false);
+            data_source.process_into_player_from_queue(&player)
+        };
+
+        if result.is_ok() && self.is_potentially_playing() {
+            if let Err(error) = player.lock().unwrap().play() {
+                warn!("Could not play MediaSource-backed media: {error:?}");
+            }
+        }
+
+        if result == Err(PlayerError::EnoughData) && lock_after_enough {
+            self.mse_data_source.borrow().set_locked(true);
+        }
+    }
+
+    pub(crate) fn mse_append_buffer(&self, bytes: Vec<u8>) -> ErrorResult {
+        {
+            let mut data_source = self.mse_data_source.borrow_mut();
+            data_source.add_buffer_to_queue(DataBuffer::Payload(bytes));
+        }
+        self.process_mse_data_queue(/* lock_after_enough */ true);
+        Ok(())
+    }
+
+    pub(crate) fn mse_end_of_stream(&self) -> ErrorResult {
+        {
+            let mut data_source = self.mse_data_source.borrow_mut();
+            data_source.add_buffer_to_queue(DataBuffer::EndOfStream);
+        }
+        self.process_mse_data_queue(/* lock_after_enough */ true);
+        Ok(())
+    }
+
     pub(crate) fn set_audio_track(&self, idx: usize, enabled: bool) {
         if let Some(ref player) = *self.player.borrow() {
             if let Err(error) = player.lock().unwrap().set_audio_track(idx as i32, enabled) {
@@ -2374,9 +2465,27 @@ impl HTMLMediaElement {
         metadata: &servo_media::player::metadata::Metadata,
         can_gc: CanGc,
     ) {
+        if raydex_trace_mse_enabled() {
+            eprintln!(
+                "Raydex Servo MSE: playback metadata handler ready={:?} duration={:?} width={} height={} tracks(video={}, audio={})",
+                self.ready_state.get(),
+                metadata.duration,
+                metadata.width,
+                metadata.height,
+                metadata.video_tracks.len(),
+                metadata.audio_tracks.len(),
+            );
+        }
+
         // The following steps should be run once on the initial `metadata` signal from the media
         // engine.
         if self.ready_state.get() != ReadyState::HaveNothing {
+            if raydex_trace_mse_enabled() {
+                eprintln!(
+                    "Raydex Servo MSE: metadata ignored because ready={:?}",
+                    self.ready_state.get(),
+                );
+            }
             return;
         }
 
@@ -2712,6 +2821,10 @@ impl HTMLMediaElement {
                 current_fetch_context.cancel(CancelReason::Backoff);
             }
         }
+
+        if self.has_media_source_object() {
+            self.mse_data_source.borrow().set_locked(true);
+        }
     }
 
     fn playback_position_changed(&self, position: f64) {
@@ -3037,19 +3150,26 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-srcobject>
-    fn GetSrcObject(&self) -> Option<MediaStreamOrBlob> {
+    fn GetSrcObject(&self) -> Option<MediaStreamOrBlobOrMediaSource> {
         (*self.src_object.borrow())
             .as_ref()
             .map(|src_object| match src_object {
-                SrcObject::Blob(blob) => MediaStreamOrBlob::Blob(DomRoot::from_ref(blob)),
+                SrcObject::Blob(blob) => MediaStreamOrBlobOrMediaSource::Blob(DomRoot::from_ref(blob)),
                 SrcObject::MediaStream(stream) => {
-                    MediaStreamOrBlob::MediaStream(DomRoot::from_ref(stream))
+                    MediaStreamOrBlobOrMediaSource::MediaStream(DomRoot::from_ref(stream))
+                },
+                SrcObject::MediaSource(media_source) => {
+                    MediaStreamOrBlobOrMediaSource::MediaSource(DomRoot::from_ref(media_source))
                 },
             })
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-srcobject>
-    fn SetSrcObject(&self, cx: &mut js::context::JSContext, value: Option<MediaStreamOrBlob>) {
+    fn SetSrcObject(
+        &self,
+        cx: &mut js::context::JSContext,
+        value: Option<MediaStreamOrBlobOrMediaSource>,
+    ) {
         *self.src_object.borrow_mut() = value.map(|value| value.into());
         self.media_element_load_algorithm(cx);
     }
@@ -3586,14 +3706,35 @@ impl BufferedDataSource {
         while let Some(buffer) = self.buffers.pop_front() {
             match buffer {
                 DataBuffer::Payload(payload) => {
-                    if let Err(error) = player.lock().unwrap().push_data(payload) {
+                    if raydex_trace_mse_enabled() {
+                        eprintln!(
+                            "Raydex Servo MSE: pushing {} bytes into media backend",
+                            payload.len(),
+                        );
+                    }
+                    if let Err(error) = player.lock().unwrap().push_data(payload.clone()) {
+                        if raydex_trace_mse_enabled() {
+                            eprintln!(
+                                "Raydex Servo MSE: media backend push failed: {error:?}",
+                            );
+                        }
                         warn!("Could not push input data to player: {error:?}");
+                        if error == PlayerError::EnoughData {
+                            self.buffers.push_front(DataBuffer::Payload(payload));
+                            self.locked.set(true);
+                        }
                         return Err(error);
+                    } else if raydex_trace_mse_enabled() {
+                        eprintln!("Raydex Servo MSE: media backend push ok");
                     }
                 },
                 DataBuffer::EndOfStream => {
                     if let Err(error) = player.lock().unwrap().end_of_stream() {
                         warn!("Could not signal EOS to player: {error:?}");
+                        if error == PlayerError::EnoughData {
+                            self.buffers.push_front(DataBuffer::EndOfStream);
+                            self.locked.set(true);
+                        }
                         return Err(error);
                     }
                 },
@@ -4015,12 +4156,30 @@ impl HTMLMediaElementEventHandler {
         cx: &mut js::context::JSContext,
     ) {
         let Some(element) = self.element.root() else {
+            if raydex_trace_mse_enabled() {
+                eprintln!("Raydex Servo MSE: dropping player event for dead media element");
+            }
             return;
         };
 
         // Abort event processing if the associated media player is outdated.
         if element.player_id().is_none_or(|id| id != player_id) {
+            if raydex_trace_mse_enabled() {
+                eprintln!(
+                    "Raydex Servo MSE: dropping stale player event player_id={} current={:?} event={:?}",
+                    player_id,
+                    element.player_id(),
+                    event,
+                );
+            }
             return;
+        }
+
+        if raydex_trace_mse_enabled() {
+            eprintln!(
+                "Raydex Servo MSE: handling player event player_id={} event={:?}",
+                player_id, event
+            );
         }
 
         match event {

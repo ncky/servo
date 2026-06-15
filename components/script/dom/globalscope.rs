@@ -38,7 +38,7 @@ use js::rust::{
     Runtime, get_object_class,
 };
 use js::{JSCLASS_IS_DOMJSCLASS, JSCLASS_IS_GLOBAL};
-use net_traits::blob_url_store::BlobBuf;
+use net_traits::blob_url_store::{BlobBuf, parse_blob_url};
 use net_traits::filemanager_thread::{
     FileManagerResult, FileManagerThreadMsg, ReadFileProgress, RelativePos,
 };
@@ -122,6 +122,7 @@ use crate::dom::file::File;
 use crate::dom::global_scope_script_execution::{ErrorReporting, compile_script, evaluate_script};
 use crate::dom::idbfactory::IDBFactory;
 use crate::dom::messageport::MessagePort;
+use crate::dom::mediasource::MediaSource;
 use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
 use crate::dom::performance::performance::Performance;
 use crate::dom::performance::performanceentry::EntryType;
@@ -227,6 +228,9 @@ pub(crate) struct GlobalScope {
 
     /// The blobs managed by this global, if any.
     blob_state: DomRefCell<HashMapTracedValues<BlobId, BlobInfo, FxBuildHasher>>,
+
+    /// MediaSource objects exposed through object URLs created in this global.
+    media_source_object_urls: DomRefCell<HashMapTracedValues<Uuid, Dom<MediaSource>, FxBuildHasher>>,
 
     /// <https://w3c.github.io/ServiceWorker/#environment-settings-object-service-worker-registration-object-map>
     registration_map: DomRefCell<
@@ -783,6 +787,7 @@ impl GlobalScope {
             broadcast_channel_state: DomRefCell::new(BroadcastChannelState::UnManaged),
             constellation_interest_counts: RefCell::new(HashMap::new()),
             blob_state: Default::default(),
+            media_source_object_urls: DomRefCell::new(HashMapTracedValues::new_fx()),
             eventtarget: EventTarget::new_inherited(),
             registration_map: DomRefCell::new(HashMapTracedValues::new_fx()),
             indexeddb: Default::default(),
@@ -1844,6 +1849,34 @@ impl GlobalScope {
         };
 
         self.track_blob_info(blob_info, blob_id);
+    }
+
+    pub(crate) fn track_media_source_object_url(&self, media_source: &MediaSource) -> Uuid {
+        let id = Uuid::new_v4();
+        self.media_source_object_urls
+            .borrow_mut()
+            .insert(id, Dom::from_ref(media_source));
+        id
+    }
+
+    pub(crate) fn get_media_source_object_url(
+        &self,
+        url: &ServoUrl,
+    ) -> Option<DomRoot<MediaSource>> {
+        let Ok((id, _)) = parse_blob_url(url) else {
+            return None;
+        };
+        self.media_source_object_urls
+            .borrow()
+            .get(&id)
+            .map(|media_source| DomRoot::from_ref(&**media_source))
+    }
+
+    pub(crate) fn revoke_media_source_object_url(&self, url: &ServoUrl) {
+        let Ok((id, _)) = parse_blob_url(url) else {
+            return;
+        };
+        self.media_source_object_urls.borrow_mut().remove(&id);
     }
 
     /// Start tracking a file

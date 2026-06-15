@@ -32,7 +32,13 @@ impl GStreamerRegistryScanner {
     }
 
     fn is_codec_supported(&self, codec: &str) -> bool {
-        self.supported_codecs.contains(codec)
+        self.supported_codecs.iter().any(|supported| {
+            if let Some(prefix) = supported.strip_suffix('*') {
+                codec.starts_with(prefix)
+            } else {
+                codec.eq_ignore_ascii_case(supported)
+            }
+        })
     }
 
     pub fn are_all_codecs_supported(&self, codecs: &Vec<&str>) -> bool {
@@ -114,10 +120,12 @@ impl GStreamerRegistryScanner {
             }
         }
 
-        let is_h264_decoder_available = has_element_for_media_type(
-            &video_decoder_factories,
-            "video/x-h264, profile=(string){ constrained-baseline, baseline, high }",
-        );
+        let is_h264_decoder_available =
+            has_element_for_media_type(&video_decoder_factories, "video/x-h264") ||
+                has_element_for_media_type(
+                    &video_decoder_factories,
+                    "video/x-h264, profile=(string){ constrained-baseline, baseline, high }",
+                );
         if is_h264_decoder_available &&
             has_element_for_media_type(&video_parser_factories, "video/x-h264")
         {
@@ -125,6 +133,8 @@ impl GStreamerRegistryScanner {
             self.supported_mime_types.insert("video/x-m4v");
             self.supported_codecs.insert("x-h264");
             self.supported_codecs.insert("avc*");
+            self.supported_codecs.insert("avc1*");
+            self.supported_codecs.insert("avc3*");
             self.supported_codecs.insert("mp4v*");
         }
 
@@ -174,14 +184,9 @@ impl GStreamerRegistryScanner {
             self.supported_mime_types.insert("application/x-mpegurl");
         }
 
-        if has_element_for_media_type(&demux_factories, "application/x-wav") ||
-            has_element_for_media_type(&demux_factories, "audio/x-wav")
-        {
-            self.supported_mime_types.insert("audio/wav");
-            self.supported_mime_types.insert("audio/vnd.wav");
-            self.supported_mime_types.insert("audio/x-wav");
-            self.supported_codecs.insert("1");
-        }
+        // Raydex's embedded single-process path can advance WAV playback time with GStreamer
+        // installed, but the sink output is silent in our app-level audio smoke. Do not
+        // advertise WAV until that path is fixed end-to-end.
 
         if has_element_for_media_type(&demux_factories, "video/quicktime, variant=(string)3gpp") {
             self.supported_mime_types.insert("video/3gpp");
@@ -244,6 +249,13 @@ impl GStreamerRegistryScanner {
         {
             self.supported_codecs.insert("av01*");
         }
+
+        if std::env::var_os("RAYDEX_SERVO_TRACE").is_some() {
+            eprintln!(
+                "Raydex Servo media scanner: supported mime={:?} codecs={:?}",
+                self.supported_mime_types, self.supported_codecs
+            );
+        }
     }
 }
 
@@ -254,7 +266,7 @@ fn has_element_for_media_type(
     match gstreamer::caps::Caps::from_str(media_type) {
         Ok(caps) => {
             for factory in factories {
-                if factory.can_sink_all_caps(&caps) {
+                if factory.can_sink_any_caps(&caps) || factory.can_sink_all_caps(&caps) {
                     return true;
                 }
             }

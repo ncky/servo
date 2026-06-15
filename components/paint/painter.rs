@@ -14,7 +14,6 @@ use embedder_traits::{
     ScreenshotCaptureError, Scroll, ViewportDetails, WebViewPoint, WebViewRect,
 };
 use euclid::{Point2D, Rect, Scale, Size2D};
-use gleam::gl::RENDERER;
 use image::RgbaImage;
 use log::{debug, error, info, warn};
 use media::WindowGLContext;
@@ -39,7 +38,7 @@ use servo_geometry::DeviceIndependentPixel;
 use smallvec::SmallVec;
 use style_traits::CSSPixel;
 use webrender::{
-    MemoryReport, ONE_TIME_USAGE_HINT, RenderApi, ShaderPrecacheFlags, Transaction, UploadMethod,
+    MemoryReport, RenderApi, ShaderPrecacheFlags, Transaction, UploadMethod,
 };
 use webrender_api::units::{
     DevicePixel, DevicePoint, LayoutPoint, LayoutRect, LayoutSize, LayoutTransform, LayoutVector2D,
@@ -199,13 +198,11 @@ impl Painter {
             clear_color[3] as f32,
         );
 
-        // Use same texture upload method as Gecko with ANGLE:
-        // https://searchfox.org/mozilla-central/source/gfx/webrender_bindings/src/bindings.rs#1215-1219
-        let upload_method = if webrender_gl.get_string(RENDERER).starts_with("ANGLE") {
-            UploadMethod::Immediate
-        } else {
-            UploadMethod::PixelBuffer(ONE_TIME_USAGE_HINT)
-        };
+        // Raydex embeds Servo inside raylib's current OpenGL context and composites
+        // WebRender into an app-owned FBO. PBO uploads and texture swizzling are
+        // useful in a browser-owned GL stack, but have produced blank composites in
+        // this shared-context path. Prefer the conservative immediate upload path.
+        let upload_method = UploadMethod::Immediate;
         let worker_threads = std::thread::available_parallelism()
             .map(|i| i.get())
             .unwrap_or(pref!(threadpools_fallback_worker_num) as usize)
@@ -227,7 +224,7 @@ impl Painter {
                 // on Android emulators with unoptimized shaders. This is due to a known
                 // issue in the emulator's OpenGL emulation layer.
                 // See: https://github.com/servo/servo/issues/31726
-                use_optimized_shaders: true,
+                use_optimized_shaders: false,
                 resource_override_path: opts::get().shaders_path.clone(),
                 debug_flags: webrender::DebugFlags::empty(),
                 precache_flags: if pref!(gfx_precache_shaders) {
@@ -236,8 +233,8 @@ impl Painter {
                     ShaderPrecacheFlags::empty()
                 },
                 enable_aa: pref!(gfx_text_antialiasing_enabled),
-                enable_subpixel_aa: pref!(gfx_subpixel_text_antialiasing_enabled),
-                allow_texture_swizzling: pref!(gfx_texture_swizzling_enabled),
+                enable_subpixel_aa: false,
+                allow_texture_swizzling: false,
                 enable_dithering: true,
                 clear_color,
                 upload_method,
@@ -425,7 +422,24 @@ impl Painter {
                 self.clear_background();
                 if let Some(renderer) = self.webrender_renderer.as_mut() {
                     let size = self.rendering_context.size2d().to_i32();
-                    renderer.render(size, 0 /* buffer_age */).ok();
+                    match renderer.render(size, 0 /* buffer_age */) {
+                        Ok(results) => {
+                            if std::env::var_os("RAYDEX_SERVO_TRACE").is_some() {
+                                eprintln!(
+                                    "Raydex Servo WebRender render ok: draw_calls={} color_targets={} alpha_targets={} dirty_rects={:?}",
+                                    results.stats.total_draw_calls,
+                                    results.stats.color_target_count,
+                                    results.stats.alpha_target_count,
+                                    results.dirty_rects
+                                );
+                            }
+                        },
+                        Err(errors) => {
+                            if std::env::var_os("RAYDEX_SERVO_TRACE").is_some() {
+                                eprintln!("Raydex Servo WebRender render errors: {errors:?}");
+                            }
+                        },
+                    }
                 }
             }
         );

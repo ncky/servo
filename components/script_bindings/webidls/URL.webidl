@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 // https://url.spec.whatwg.org/#url
+typedef (Blob or MediaSource) BlobURLProvider;
+
 [Exposed=(Window,Worker),
  LegacyWindowAlias=webkitURL]
 interface URL {
@@ -26,7 +28,7 @@ interface URL {
            attribute USVString hash;
 
   // https://w3c.github.io/FileAPI/#creating-revoking
-  static DOMString createObjectURL(Blob blob);
+  static DOMString createObjectURL(BlobURLProvider obj);
   // static DOMString createFor(Blob blob);
   static undefined revokeObjectURL(DOMString url);
 

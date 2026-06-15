@@ -18,11 +18,11 @@ use uuid::Uuid;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::URLBinding::URLMethods;
+use crate::dom::bindings::codegen::UnionTypes::BlobOrMediaSource;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
-use crate::dom::blob::Blob;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::url::urlhelper::UrlHelper;
 use crate::dom::url::urlsearchparams::URLSearchParams;
@@ -190,12 +190,17 @@ impl URLMethods<crate::DomTypeHolder> for URL {
     }
 
     /// <https://w3c.github.io/FileAPI/#dfn-createObjectURL>
-    fn CreateObjectURL(global: &GlobalScope, blob: &Blob) -> DOMString {
+    fn CreateObjectURL(global: &GlobalScope, object: BlobOrMediaSource) -> DOMString {
         // XXX: Second field is an unicode-serialized Origin, it is a temporary workaround
         //      and should not be trusted. See issue https://github.com/servo/servo/issues/11722
         let origin = global.origin().immutable();
 
-        let id = blob.get_blob_url_id();
+        let id = match object {
+            BlobOrMediaSource::Blob(blob) => blob.get_blob_url_id(),
+            BlobOrMediaSource::MediaSource(media_source) => {
+                global.track_media_source_object_url(&media_source)
+            },
+        };
 
         DOMString::from(URL::unicode_serialization_blob_url(origin, &id))
     }
@@ -210,6 +215,8 @@ impl URLMethods<crate::DomTypeHolder> for URL {
         if let Ok(url) = ServoUrl::parse(&url.str()) {
             if url.fragment().is_none() && *origin == url.origin() {
                 if let Ok((id, _)) = parse_blob_url(&url) {
+                    global.revoke_media_source_object_url(&url);
+
                     let resource_threads = global.resource_threads();
                     let (tx, rx) =
                         generic_channel::channel(global.time_profiler_chan().clone()).unwrap();

@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time;
 
 use byte_slice_cast::AsSliceOf;
@@ -39,6 +39,11 @@ const DEFAULT_VOLUME: f64 = 1.0;
 const DEFAULT_TIME_RANGES: Vec<Range<f64>> = vec![];
 
 const MAX_BUFFER_SIZE: i32 = 500 * 1024 * 1024;
+
+fn raydex_trace_mse_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RAYDEX_SERVO_TRACE_MSE").is_some())
+}
 
 fn metadata_from_media_info(media_info: &gstreamer_play::PlayMediaInfo) -> Result<Metadata, ()> {
     let dur = media_info.duration();
@@ -658,6 +663,9 @@ impl GStreamerPlayer {
         let observer = self.observer.clone();
         // Handle `state-changed` signal.
         signal_adapter.connect_state_changed(move |_, play_state| {
+            if raydex_trace_mse_enabled() {
+                eprintln!("Raydex Servo GStreamer: state changed {play_state:?}");
+            }
             inner_clone.lock().unwrap().play_state = play_state;
 
             let state = match play_state {
@@ -690,6 +698,15 @@ impl GStreamerPlayer {
         let inner_clone = inner.clone();
         let observer = self.observer.clone();
         signal_adapter.connect_media_info_updated(move |_, info| {
+            if raydex_trace_mse_enabled() {
+                eprintln!(
+                    "Raydex Servo GStreamer: media info updated duration={:?} video_streams={} audio_streams={} container={:?}",
+                    info.duration(),
+                    info.number_of_video_streams(),
+                    info.number_of_audio_streams(),
+                    info.container_format(),
+                );
+            }
             let Ok(metadata) = metadata_from_media_info(info) else {
                 return;
             };
@@ -764,7 +781,16 @@ impl GStreamerPlayer {
                 let weak_video_renderer = Arc::downgrade(&video_renderer);
 
                 move |sample: gstreamer::Sample| {
+                    if raydex_trace_mse_enabled() {
+                        eprintln!(
+                            "Raydex Servo GStreamer: video sample caps={:?}",
+                            sample.caps(),
+                        );
+                    }
                     let Some(frame) = render.lock().unwrap().get_frame_from_sample(sample) else {
+                        if raydex_trace_mse_enabled() {
+                            eprintln!("Raydex Servo GStreamer: video sample conversion failed");
+                        }
                         return Err(gstreamer::FlowError::Error);
                     };
 

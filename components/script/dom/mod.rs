@@ -299,6 +299,7 @@ pub(crate) mod intersectionobserverentry;
 pub(crate) mod location;
 pub(crate) mod media;
 pub(crate) use self::media::*;
+pub(crate) mod mediasource;
 pub(crate) mod messagechannel;
 #[expect(dead_code)]
 pub(crate) mod messageport;
@@ -351,6 +352,8 @@ pub(crate) mod shadowroot;
 pub(crate) mod staticrange;
 pub(crate) mod storage;
 pub(crate) mod storagemanager;
+pub(crate) mod sourcebuffer;
+pub(crate) mod sourcebufferlist;
 pub(crate) mod stream;
 pub(crate) use self::stream::*;
 pub(crate) mod svg;
