@@ -3508,6 +3508,11 @@ impl Document {
         let has_focus = window.parent_info().is_none();
 
         let has_browsing_context = has_browsing_context == HasBrowsingContext::Yes;
+        let visibility_state = if has_browsing_context {
+            DocumentVisibilityState::Visible
+        } else {
+            DocumentVisibilityState::Hidden
+        };
 
         Document {
             node: Node::new_document_node(),
@@ -3621,7 +3626,7 @@ impl Document {
             declarative_refresh: Default::default(),
             resize_observers: Default::default(),
             fonts: Default::default(),
-            visibility_state: Cell::new(DocumentVisibilityState::Hidden),
+            visibility_state: Cell::new(visibility_state),
             status_code,
             is_initial_about_blank: Cell::new(is_initial_about_blank),
             allow_declarative_shadow_roots: Cell::new(allow_declarative_shadow_roots),
