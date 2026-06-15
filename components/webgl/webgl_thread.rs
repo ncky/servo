@@ -111,18 +111,18 @@ pub struct GLState {
 impl GLState {
     // Are we faking having no alpha / depth / stencil?
     fn fake_no_alpha(&self) -> bool {
-        self.drawing_to_default_framebuffer &
-            !self.requested_flags.contains(ContextAttributeFlags::ALPHA)
+        self.drawing_to_default_framebuffer
+            & !self.requested_flags.contains(ContextAttributeFlags::ALPHA)
     }
 
     fn fake_no_depth(&self) -> bool {
-        self.drawing_to_default_framebuffer &
-            !self.requested_flags.contains(ContextAttributeFlags::DEPTH)
+        self.drawing_to_default_framebuffer
+            & !self.requested_flags.contains(ContextAttributeFlags::DEPTH)
     }
 
     fn fake_no_stencil(&self) -> bool {
-        self.drawing_to_default_framebuffer &
-            !self
+        self.drawing_to_default_framebuffer
+            & !self
                 .requested_flags
                 .contains(ContextAttributeFlags::STENCIL)
     }
@@ -467,6 +467,29 @@ impl WebGLThread {
             .expect("Should be called with a valid WebGLContextId")
     }
 
+    fn destroy_unregistered_webgl_context(
+        &mut self,
+        context_id: Option<WebGLContextId>,
+        device: &Device,
+        ctx: &mut Context,
+        reason: &str,
+    ) {
+        if let Some(context_id) = context_id {
+            if let Err(err) = self.webrender_swap_chains.destroy(context_id, device, ctx) {
+                warn!(
+                    "Failed to destroy unregistered WebGL swap chain after {reason}: {:?}",
+                    err
+                );
+            }
+        }
+        if let Err(err) = device.destroy_context(ctx) {
+            warn!(
+                "Failed to destroy unregistered WebGL context after {reason}: {:?}",
+                err
+            );
+        }
+    }
+
     /// A function like `Self::device_for_context`, except that it does not panic if the context
     /// cannot be found. This is useful for WebXR, which might try to access WebGL contexts after
     /// they have been cleaned up.
@@ -535,10 +558,10 @@ impl WebGLThread {
         // WebGL requires all contexts to be able to create framebuffers with
         // alpha, depth and stencil. So we always create a context with them,
         // and fake not having them if requested.
-        let flags = requested_flags |
-            ContextAttributeFlags::ALPHA |
-            ContextAttributeFlags::DEPTH |
-            ContextAttributeFlags::STENCIL;
+        let flags = requested_flags
+            | ContextAttributeFlags::ALPHA
+            | ContextAttributeFlags::DEPTH
+            | ContextAttributeFlags::STENCIL;
         let context_attributes = &ContextAttributes {
             version: webgl_version.to_surfman_version(api_type),
             flags,
@@ -561,16 +584,37 @@ impl WebGLThread {
         let mut ctx = device
             .create_context(&context_descriptor, None)
             .map_err(|err| format!("Failed to create the GL context: {:?}", err))?;
-        let surface = device
-            .create_surface(&ctx, surface_access, surface_type)
-            .map_err(|err| format!("Failed to create the initial surface: {:?}", err))?;
-        device
-            .bind_surface_to_context(&mut ctx, surface)
-            .map_err(|err| format!("Failed to bind initial surface: {:?}", err))?;
+        let surface = match device.create_surface(&ctx, surface_access, surface_type) {
+            Ok(surface) => surface,
+            Err(err) => {
+                self.destroy_unregistered_webgl_context(
+                    None,
+                    &device,
+                    &mut ctx,
+                    "initial surface creation failure",
+                );
+                return Err(format!("Failed to create the initial surface: {:?}", err));
+            },
+        };
+        if let Err(err) = device.bind_surface_to_context(&mut ctx, surface) {
+            self.destroy_unregistered_webgl_context(
+                None,
+                &device,
+                &mut ctx,
+                "initial surface bind failure",
+            );
+            return Err(format!("Failed to bind initial surface: {:?}", err));
+        }
         // https://github.com/pcwalton/surfman/issues/7
-        device
-            .make_context_current(&ctx)
-            .map_err(|err| format!("Failed to make new context current: {:?}", err))?;
+        if let Err(err) = device.make_context_current(&ctx) {
+            self.destroy_unregistered_webgl_context(
+                None,
+                &device,
+                &mut ctx,
+                "make-current failure",
+            );
+            return Err(format!("Failed to make new context current: {:?}", err));
+        }
 
         let context_id = WebGLContextId(
             self.external_image_id_manager
@@ -578,14 +622,30 @@ impl WebGLThread {
                 .0,
         );
 
-        self.webrender_swap_chains
-            .create_attached_swap_chain(context_id, &*device, &mut ctx, surface_access)
-            .map_err(|err| format!("Failed to create swap chain: {:?}", err))?;
+        if let Err(err) = self.webrender_swap_chains.create_attached_swap_chain(
+            context_id,
+            &*device,
+            &mut ctx,
+            surface_access,
+        ) {
+            self.destroy_unregistered_webgl_context(
+                None,
+                &device,
+                &mut ctx,
+                "swap-chain creation failure",
+            );
+            return Err(format!("Failed to create swap chain: {:?}", err));
+        }
 
-        let swap_chain = self
-            .webrender_swap_chains
-            .get(context_id)
-            .expect("Failed to get the swap chain");
+        if self.webrender_swap_chains.get(context_id).is_none() {
+            self.destroy_unregistered_webgl_context(
+                Some(context_id),
+                &device,
+                &mut ctx,
+                "missing swap chain",
+            );
+            return Err("Failed to get the swap chain".to_string());
+        }
 
         debug!(
             "Created webgl context {:?}/{:?}",
@@ -609,9 +669,20 @@ impl WebGLThread {
         let size = clamp_viewport(&gl, requested_size);
         if safe_size != size {
             debug!("Resizing swap chain from {:?} to {:?}", safe_size, size);
-            swap_chain
-                .resize(&device, &mut ctx, size.to_i32())
-                .map_err(|err| format!("Failed to resize swap chain: {:?}", err))?;
+            let resize_result = self
+                .webrender_swap_chains
+                .get(context_id)
+                .expect("Failed to get the swap chain")
+                .resize(&device, &mut ctx, size.to_i32());
+            if let Err(err) = resize_result {
+                self.destroy_unregistered_webgl_context(
+                    Some(context_id),
+                    &device,
+                    &mut ctx,
+                    "swap-chain resize failure",
+                );
+                return Err(format!("Failed to resize swap chain: {:?}", err));
+            }
         }
 
         let descriptor = device.context_descriptor(&ctx);
@@ -619,12 +690,36 @@ impl WebGLThread {
         let gl_version = descriptor_attributes.version;
         let has_alpha = requested_flags.contains(ContextAttributeFlags::ALPHA);
 
-        device.make_context_current(&ctx).unwrap();
-        let framebuffer = device
-            .context_surface_info(&ctx)
-            .map_err(|err| format!("Failed to get context surface info: {:?}", err))?
-            .ok_or_else(|| "Failed to get context surface info".to_string())?
-            .framebuffer_object;
+        if let Err(err) = device.make_context_current(&ctx) {
+            self.destroy_unregistered_webgl_context(
+                Some(context_id),
+                &device,
+                &mut ctx,
+                "make-current failure before clear",
+            );
+            return Err(format!("Failed to make new context current: {:?}", err));
+        }
+        let framebuffer = match device.context_surface_info(&ctx) {
+            Ok(Some(info)) => info.framebuffer_object,
+            Ok(None) => {
+                self.destroy_unregistered_webgl_context(
+                    Some(context_id),
+                    &device,
+                    &mut ctx,
+                    "missing context surface info",
+                );
+                return Err("Failed to get context surface info".to_string());
+            },
+            Err(err) => {
+                self.destroy_unregistered_webgl_context(
+                    Some(context_id),
+                    &device,
+                    &mut ctx,
+                    "context surface info failure",
+                );
+                return Err(format!("Failed to get context surface info: {:?}", err));
+            },
+        };
 
         unsafe {
             gl.bind_framebuffer(gl::FRAMEBUFFER, framebuffer);
@@ -1238,9 +1333,9 @@ impl WebGLImpl {
                 gl.polygon_offset(factor, units)
             },
             WebGLCommand::ReadPixels(rect, format, pixel_type, ref sender) => {
-                let len = bytes_per_type(pixel_type) *
-                    components_per_format(format) *
-                    rect.size.area() as usize;
+                let len = bytes_per_type(pixel_type)
+                    * components_per_format(format)
+                    * rect.size.area() as usize;
                 let mut pixels = vec![0; len];
                 unsafe {
                     // We don't want any alignment padding on pixel rows.
@@ -2917,10 +3012,10 @@ fn image_to_tex_image_data(
     }
 
     match (format, data_type) {
-        (TexFormat::RGBA, TexDataType::UnsignedByte) |
-        (TexFormat::RGBA8, TexDataType::UnsignedByte) => pixels,
-        (TexFormat::RGB, TexDataType::UnsignedByte) |
-        (TexFormat::RGB8, TexDataType::UnsignedByte) => {
+        (TexFormat::RGBA, TexDataType::UnsignedByte)
+        | (TexFormat::RGBA8, TexDataType::UnsignedByte) => pixels,
+        (TexFormat::RGB, TexDataType::UnsignedByte)
+        | (TexFormat::RGB8, TexDataType::UnsignedByte) => {
             for i in 0..pixel_count {
                 let rgb = {
                     let rgb = &pixels[i * 4..i * 4 + 3];
@@ -2963,10 +3058,10 @@ fn image_to_tex_image_data(
             for i in 0..pixel_count {
                 let p = {
                     let rgba = &pixels[i * 4..i * 4 + 4];
-                    ((rgba[0] as u16 & 0xf0) << 8) |
-                        ((rgba[1] as u16 & 0xf0) << 4) |
-                        (rgba[2] as u16 & 0xf0) |
-                        ((rgba[3] as u16 & 0xf0) >> 4)
+                    ((rgba[0] as u16 & 0xf0) << 8)
+                        | ((rgba[1] as u16 & 0xf0) << 4)
+                        | (rgba[2] as u16 & 0xf0)
+                        | ((rgba[3] as u16 & 0xf0) >> 4)
                 };
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
             }
@@ -2977,10 +3072,10 @@ fn image_to_tex_image_data(
             for i in 0..pixel_count {
                 let p = {
                     let rgba = &pixels[i * 4..i * 4 + 4];
-                    ((rgba[0] as u16 & 0xf8) << 8) |
-                        ((rgba[1] as u16 & 0xf8) << 3) |
-                        ((rgba[2] as u16 & 0xf8) >> 2) |
-                        ((rgba[3] as u16) >> 7)
+                    ((rgba[0] as u16 & 0xf8) << 8)
+                        | ((rgba[1] as u16 & 0xf8) << 3)
+                        | ((rgba[2] as u16 & 0xf8) >> 2)
+                        | ((rgba[3] as u16) >> 7)
                 };
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
             }
@@ -2991,9 +3086,9 @@ fn image_to_tex_image_data(
             for i in 0..pixel_count {
                 let p = {
                     let rgb = &pixels[i * 4..i * 4 + 3];
-                    ((rgb[0] as u16 & 0xf8) << 8) |
-                        ((rgb[1] as u16 & 0xfc) << 3) |
-                        ((rgb[2] as u16 & 0xf8) >> 3)
+                    ((rgb[0] as u16 & 0xf8) << 8)
+                        | ((rgb[1] as u16 & 0xfc) << 3)
+                        | ((rgb[2] as u16 & 0xf8) >> 3)
                 };
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
             }
@@ -3029,8 +3124,8 @@ fn image_to_tex_image_data(
             pixels
         },
 
-        (TexFormat::Luminance, TexDataType::Float) |
-        (TexFormat::Luminance32f, TexDataType::Float) => {
+        (TexFormat::Luminance, TexDataType::Float)
+        | (TexFormat::Luminance32f, TexDataType::Float) => {
             for rgba8 in pixels.chunks_mut(4) {
                 let p = rgba8[0] as f32;
                 NativeEndian::write_f32(rgba8, p);
@@ -3038,8 +3133,8 @@ fn image_to_tex_image_data(
             pixels
         },
 
-        (TexFormat::LuminanceAlpha, TexDataType::Float) |
-        (TexFormat::LuminanceAlpha32f, TexDataType::Float) => {
+        (TexFormat::LuminanceAlpha, TexDataType::Float)
+        | (TexFormat::LuminanceAlpha32f, TexDataType::Float) => {
             let mut data = Vec::<u8>::with_capacity(pixel_count * 8);
             for rgba8 in pixels.chunks(4) {
                 data.write_f32::<NativeEndian>(rgba8[0] as f32).unwrap();
@@ -3048,8 +3143,8 @@ fn image_to_tex_image_data(
             data
         },
 
-        (TexFormat::RGBA, TexDataType::HalfFloat) |
-        (TexFormat::RGBA16f, TexDataType::HalfFloat) => {
+        (TexFormat::RGBA, TexDataType::HalfFloat)
+        | (TexFormat::RGBA16f, TexDataType::HalfFloat) => {
             let mut rgbaf16 = Vec::<u8>::with_capacity(pixel_count * 8);
             for rgba8 in pixels.chunks(4) {
                 rgbaf16
@@ -3083,8 +3178,8 @@ fn image_to_tex_image_data(
             }
             rgbf16
         },
-        (TexFormat::Alpha, TexDataType::HalfFloat) |
-        (TexFormat::Alpha16f, TexDataType::HalfFloat) => {
+        (TexFormat::Alpha, TexDataType::HalfFloat)
+        | (TexFormat::Alpha16f, TexDataType::HalfFloat) => {
             for i in 0..pixel_count {
                 let p = f16::from_f32(pixels[i * 4 + 3] as f32).to_bits();
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
@@ -3092,8 +3187,8 @@ fn image_to_tex_image_data(
             pixels.truncate(pixel_count * 2);
             pixels
         },
-        (TexFormat::Luminance, TexDataType::HalfFloat) |
-        (TexFormat::Luminance16f, TexDataType::HalfFloat) => {
+        (TexFormat::Luminance, TexDataType::HalfFloat)
+        | (TexFormat::Luminance16f, TexDataType::HalfFloat) => {
             for i in 0..pixel_count {
                 let p = f16::from_f32(pixels[i * 4] as f32).to_bits();
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
@@ -3101,8 +3196,8 @@ fn image_to_tex_image_data(
             pixels.truncate(pixel_count * 2);
             pixels
         },
-        (TexFormat::LuminanceAlpha, TexDataType::HalfFloat) |
-        (TexFormat::LuminanceAlpha16f, TexDataType::HalfFloat) => {
+        (TexFormat::LuminanceAlpha, TexDataType::HalfFloat)
+        | (TexFormat::LuminanceAlpha16f, TexDataType::HalfFloat) => {
             for rgba8 in pixels.chunks_mut(4) {
                 let lum = f16::from_f32(rgba8[0] as f32).to_bits();
                 let a = f16::from_f32(rgba8[3] as f32).to_bits();
@@ -3146,10 +3241,10 @@ fn premultiply_inplace(format: TexFormat, data_type: TexDataType, pixels: &mut [
                 let a = extend_to_8_bits(pix & 0x0f);
                 NativeEndian::write_u16(
                     rgba,
-                    (((pixels::multiply_u8_color(r, a) & 0xf0) as u16) << 8) |
-                        (((pixels::multiply_u8_color(g, a) & 0xf0) as u16) << 4) |
-                        ((pixels::multiply_u8_color(b, a) & 0xf0) as u16) |
-                        ((a & 0x0f) as u16),
+                    (((pixels::multiply_u8_color(r, a) & 0xf0) as u16) << 8)
+                        | (((pixels::multiply_u8_color(g, a) & 0xf0) as u16) << 4)
+                        | ((pixels::multiply_u8_color(b, a) & 0xf0) as u16)
+                        | ((a & 0x0f) as u16),
                 );
             }
         },
@@ -3167,8 +3262,8 @@ fn flip_pixels_y(
     unpacking_alignment: usize,
     pixels: Vec<u8>,
 ) -> Vec<u8> {
-    let cpp = (data_type.element_size() * internal_format.components() /
-        data_type.components_per_element()) as usize;
+    let cpp = (data_type.element_size() * internal_format.components()
+        / data_type.components_per_element()) as usize;
 
     let stride = (width * cpp + unpacking_alignment - 1) & !(unpacking_alignment - 1);
 
