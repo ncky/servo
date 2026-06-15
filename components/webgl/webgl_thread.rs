@@ -316,6 +316,13 @@ impl WebGLThread {
                 break;
             }
         }
+
+        // The embedder can tear down a page or the whole browser without the
+        // script side delivering WebGLMsg::Exit first. Surfman requires all
+        // contexts/surfaces/renderbuffers to be explicitly destroyed, so make
+        // the thread-exit path release anything still alive before the
+        // WebGLThread fields are dropped.
+        self.cleanup_all_webgl_contexts("WebGL thread shutdown");
     }
 
     fn cleanup_all_webgl_contexts(&mut self, reason: &str) {
