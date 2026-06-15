@@ -514,22 +514,26 @@ impl WebGLThread {
         &mut self,
         context_id: Option<WebGLContextId>,
         device: &Device,
-        ctx: &mut Context,
+        mut ctx: Context,
         reason: &str,
     ) {
         if let Some(context_id) = context_id {
-            if let Err(err) = self.webrender_swap_chains.destroy(context_id, device, ctx) {
+            if let Err(err) = self
+                .webrender_swap_chains
+                .destroy(context_id, device, &mut ctx)
+            {
                 warn!(
                     "Failed to destroy unregistered WebGL swap chain after {reason}: {:?}",
                     err
                 );
             }
         }
-        if let Err(err) = device.destroy_context(ctx) {
+        if let Err(err) = device.destroy_context(&mut ctx) {
             warn!(
                 "Failed to destroy unregistered WebGL context after {reason}: {:?}",
                 err
             );
+            std::mem::forget(ctx);
         }
     }
 
@@ -633,7 +637,7 @@ impl WebGLThread {
                 self.destroy_unregistered_webgl_context(
                     None,
                     &device,
-                    &mut ctx,
+                    ctx,
                     "initial surface creation failure",
                 );
                 return Err(format!("Failed to create the initial surface: {:?}", err));
@@ -643,19 +647,14 @@ impl WebGLThread {
             self.destroy_unregistered_webgl_context(
                 None,
                 &device,
-                &mut ctx,
+                ctx,
                 "initial surface bind failure",
             );
             return Err(format!("Failed to bind initial surface: {:?}", err));
         }
         // https://github.com/pcwalton/surfman/issues/7
         if let Err(err) = device.make_context_current(&ctx) {
-            self.destroy_unregistered_webgl_context(
-                None,
-                &device,
-                &mut ctx,
-                "make-current failure",
-            );
+            self.destroy_unregistered_webgl_context(None, &device, ctx, "make-current failure");
             return Err(format!("Failed to make new context current: {:?}", err));
         }
 
@@ -674,7 +673,7 @@ impl WebGLThread {
             self.destroy_unregistered_webgl_context(
                 None,
                 &device,
-                &mut ctx,
+                ctx,
                 "swap-chain creation failure",
             );
             return Err(format!("Failed to create swap chain: {:?}", err));
@@ -684,7 +683,7 @@ impl WebGLThread {
             self.destroy_unregistered_webgl_context(
                 Some(context_id),
                 &device,
-                &mut ctx,
+                ctx,
                 "missing swap chain",
             );
             return Err("Failed to get the swap chain".to_string());
@@ -721,7 +720,7 @@ impl WebGLThread {
                 self.destroy_unregistered_webgl_context(
                     Some(context_id),
                     &device,
-                    &mut ctx,
+                    ctx,
                     "swap-chain resize failure",
                 );
                 return Err(format!("Failed to resize swap chain: {:?}", err));
@@ -737,7 +736,7 @@ impl WebGLThread {
             self.destroy_unregistered_webgl_context(
                 Some(context_id),
                 &device,
-                &mut ctx,
+                ctx,
                 "make-current failure before clear",
             );
             return Err(format!("Failed to make new context current: {:?}", err));
@@ -748,7 +747,7 @@ impl WebGLThread {
                 self.destroy_unregistered_webgl_context(
                     Some(context_id),
                     &device,
-                    &mut ctx,
+                    ctx,
                     "missing context surface info",
                 );
                 return Err("Failed to get context surface info".to_string());
@@ -757,7 +756,7 @@ impl WebGLThread {
                 self.destroy_unregistered_webgl_context(
                     Some(context_id),
                     &device,
-                    &mut ctx,
+                    ctx,
                     "context surface info failure",
                 );
                 return Err(format!("Failed to get context surface info: {:?}", err));
