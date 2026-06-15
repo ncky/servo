@@ -325,14 +325,14 @@ impl PlayerInner {
                     start.unwrap()
                 } else {
                     gstreamer::format::Percent::from_percent(0)
-                } / gstreamer::format::Percent::MAX) as f64 *
-                    duration.as_secs_f64();
+                } / gstreamer::format::Percent::MAX) as f64
+                    * duration.as_secs_f64();
                 let end = (if let gstreamer::GenericFormattedValue::Percent(end) = end {
                     end.unwrap()
                 } else {
                     gstreamer::format::Percent::from_percent(0)
-                } / gstreamer::format::Percent::MAX) as f64 *
-                    duration.as_secs_f64();
+                } / gstreamer::format::Percent::MAX) as f64
+                    * duration.as_secs_f64();
                 buffered_ranges.push(Range { start, end });
             }
         }
@@ -832,7 +832,7 @@ impl GStreamerPlayer {
             );
         };
 
-        let (receiver, error_handler_id) = {
+        let (receiver, signal_adapter, error_handler_id) = {
             let inner_clone = inner.clone();
             let inner = inner.lock().unwrap();
             let pipeline = inner.player.pipeline();
@@ -937,11 +937,11 @@ impl GStreamerPlayer {
 
             inner.player.pause();
 
-            (receiver, error_handler_id)
+            (receiver, signal_adapter, error_handler_id)
         };
 
         let result = receiver.recv().unwrap();
-        glib::signal::signal_handler_disconnect(&inner.lock().unwrap().player, error_handler_id);
+        glib::signal::signal_handler_disconnect(&signal_adapter, error_handler_id);
         result
     }
 }
