@@ -184,9 +184,14 @@ impl GStreamerRegistryScanner {
             self.supported_mime_types.insert("application/x-mpegurl");
         }
 
-        // Raydex's embedded single-process path can advance WAV playback time with GStreamer
-        // installed, but the sink output is silent in our app-level audio smoke. Do not
-        // advertise WAV until that path is fixed end-to-end.
+        if has_element_for_media_type(&demux_factories, "audio/x-wav") ||
+            gstreamer::ElementFactory::find("wavparse").is_some()
+        {
+            self.supported_mime_types.insert("audio/wav");
+            self.supported_mime_types.insert("audio/wave");
+            self.supported_mime_types.insert("audio/x-wav");
+            self.supported_mime_types.insert("audio/vnd.wave");
+        }
 
         if has_element_for_media_type(&demux_factories, "video/quicktime, variant=(string)3gpp") {
             self.supported_mime_types.insert("video/3gpp");
