@@ -491,6 +491,10 @@ impl IntersectionObserver {
         target: &Element,
         maybe_root_bounds: Option<Rect<Au, CSSPixel>>,
     ) -> IntersectionObservationOutput {
+        let Some(target_document) = target.upcast::<Node>().owner_doc_if_available() else {
+            return IntersectionObservationOutput::default_skipped();
+        };
+
         // Step 5
         // > If the intersection root is not the implicit root, and target is not in
         // > the same document as the intersection root, skip to step 11.
@@ -498,13 +502,17 @@ impl IntersectionObserver {
         // > If the intersection root is an Element, and target is not a descendant of
         // > the intersection root in the containing block chain, skip to step 11.
         match &self.root {
-            Some(ElementOrDocument::Document(document)) if document != &target.owner_document() => {
+            Some(ElementOrDocument::Document(document)) if document != &target_document => {
                 return IntersectionObservationOutput::default_skipped();
             },
             Some(ElementOrDocument::Element(element)) => {
                 // To ensure consistency, we also check for elements right now, but we can depend on the
                 // layout query later.
-                if element.owner_document() != target.owner_document() {
+                let Some(element_document) = element.upcast::<Node>().owner_doc_if_available()
+                else {
+                    return IntersectionObservationOutput::default_skipped();
+                };
+                if element_document != target_document {
                     return IntersectionObservationOutput::default_skipped();
                 }
                 // TODO(stevennovaryo): implement LayoutThread query for descendant of containing block chain.
@@ -563,8 +571,8 @@ impl IntersectionObserver {
         {
             is_intersecting.into()
         } else {
-            (intersection_rect.size.width.0 as f64 / target_rect.size.width.0 as f64) *
-                (intersection_rect.size.height.0 as f64 / target_rect.size.height.0 as f64)
+            (intersection_rect.size.width.0 as f64 / target_rect.size.width.0 as f64)
+                * (intersection_rect.size.height.0 as f64 / target_rect.size.height.0 as f64)
         };
 
         // Step 13
@@ -580,8 +588,12 @@ impl IntersectionObserver {
 
         // Step 14
         // > Let isVisible be the result of running the visibility algorithm on target.
-        // TODO: Implement visibility algorithm
-        let is_visible = false;
+        //
+        // Servo does not yet implement the full v2 visibility algorithm. Reporting every
+        // intersecting target as not visible breaks apps that use `trackVisibility` (for
+        // example YouTube's visibility-gated result renderers), so approximate visibility
+        // from intersection until the occlusion/filter/opacity checks are available.
+        let is_visible = is_intersecting;
 
         IntersectionObservationOutput::new_computed(
             threshold_index,
@@ -606,12 +618,14 @@ impl IntersectionObserver {
             // Step 1
             // > Let registration be the IntersectionObserverRegistration record in target’s internal
             // > [[RegisteredIntersectionObservers]] slot whose observer property is equal to observer.
-            let registration = target.get_intersection_observer_registration(self).unwrap();
+            let Some(registration) = target.get_intersection_observer_registration(self) else {
+                continue;
+            };
 
             // Step 2
             // > If (time - registration.lastUpdateTime < observer.delay), skip further processing for target.
-            if time - registration.last_update_time.get() <
-                Duration::from_millis(self.delay.get().max(0) as u64)
+            if time - registration.last_update_time.get()
+                < Duration::from_millis(self.delay.get().max(0) as u64)
             {
                 return;
             }
@@ -637,9 +651,9 @@ impl IntersectionObserver {
             // > if isVisible does not equal previousIsVisible,
             // > queue an IntersectionObserverEntry, passing in observer, time, rootBounds,
             // > targetRect, intersectionRect, isIntersecting, isVisible, and target.
-            if intersection_output.threshold_index != previous_threshold_index ||
-                intersection_output.is_intersecting != previous_is_intersecting ||
-                intersection_output.is_visible != previous_is_visible
+            if intersection_output.threshold_index != previous_threshold_index
+                || intersection_output.is_intersecting != previous_is_intersecting
+                || intersection_output.is_visible != previous_is_visible
             {
                 // TODO(stevennovaryo): Per IntersectionObserverEntry interface, the rootBounds
                 //                      should be null for cross-origin-domain target.
@@ -865,6 +879,8 @@ fn compute_the_intersection(
     mut intersection_rect: Rect<Au, CSSPixel>,
     scroll_margin: &IntersectionObserverMargin,
 ) -> Option<Rect<Au, CSSPixel>> {
+    let target_document = target.upcast::<Node>().owner_doc_if_available()?;
+
     // > 1. Let intersectionRect be the result of getting the bounding box for target.
     // We had delegated the computation of this to the caller of the function.
 
@@ -874,7 +890,7 @@ fn compute_the_intersection(
         .containing_block_node_without_reflow()
     {
         Some(node) => ElementOrDocument::Element(DomRoot::downcast(node).unwrap()),
-        None => ElementOrDocument::Document(target.owner_document()),
+        None => ElementOrDocument::Document(target_document.clone()),
     };
 
     // Total offsets gained from traversing through multiple navigables. We use this to map the coordinate space.
@@ -968,7 +984,11 @@ fn compute_the_intersection(
             .and_then(DomRoot::downcast::<Element>)
         {
             Some(element) => ElementOrDocument::Element(element),
-            None => ElementOrDocument::Document(containing_element.owner_document()),
+            None => ElementOrDocument::Document(
+                containing_element
+                    .upcast::<Node>()
+                    .owner_doc_if_available()?,
+            ),
         };
     }
 
