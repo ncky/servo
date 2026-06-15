@@ -194,7 +194,8 @@ partial interface Document {
   undefined releaseEvents();
 
   // Tracking issue for document.all: https://github.com/servo/servo/issues/7396
-  // readonly attribute HTMLAllCollection all;
+  [SameObject]
+  readonly attribute HTMLCollection all;
 };
 
 // https://fullscreen.spec.whatwg.org/#api

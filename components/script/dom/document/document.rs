@@ -357,6 +357,7 @@ pub(crate) struct Document {
     scripts: MutNullableDom<HTMLCollection>,
     anchors: MutNullableDom<HTMLCollection>,
     applets: MutNullableDom<HTMLCollection>,
+    all: MutNullableDom<HTMLCollection>,
     /// Information about the `<iframes>` in this [`Document`].
     iframes: RefCell<IFrameCollection>,
     /// Lock use for style attributes and author-origin stylesheet objects in this document.
@@ -3545,6 +3546,7 @@ impl Document {
             scripts: Default::default(),
             anchors: Default::default(),
             applets: Default::default(),
+            all: Default::default(),
             iframes: RefCell::new(IFrameCollection::new()),
             style_shared_lock: {
                 /// Per-process shared lock for author-origin stylesheets
@@ -5561,6 +5563,17 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     fn Applets(&self, cx: &mut js::context::JSContext) -> DomRoot<HTMLCollection> {
         self.applets
             .or_init(|| HTMLCollection::always_empty(cx, &self.window, self.upcast()))
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-all>
+    fn All(&self) -> DomRoot<HTMLCollection> {
+        self.all.or_init(|| {
+            HTMLCollection::all_elements_without_cx(
+                &self.window,
+                self.upcast(),
+                CanGc::deprecated_note(),
+            )
+        })
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-document-location>

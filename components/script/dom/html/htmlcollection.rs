@@ -12,13 +12,14 @@ use stylo_atoms::Atom;
 use crate::dom::bindings::codegen::Bindings::HTMLCollectionBinding::HTMLCollectionMethods;
 use crate::dom::bindings::domname::namespace_from_domstring;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object, reflect_dom_object_with_cx};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::JSTraceable;
 use crate::dom::element::Element;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 pub(crate) trait CollectionFilter: JSTraceable {
     fn filter<'a>(&self, elem: &'a Element, root: &'a Node) -> bool;
@@ -174,6 +175,15 @@ impl HTMLCollection {
         Self::new(cx, window, root, filter)
     }
 
+    pub(crate) fn create_without_cx(
+        window: &Window,
+        root: &Node,
+        filter: Box<dyn CollectionFilter + 'static>,
+        can_gc: CanGc,
+    ) -> DomRoot<Self> {
+        reflect_dom_object(Box::new(Self::new_inherited(root, filter)), window, can_gc)
+    }
+
     /// Create a new [`HTMLCollection`] backed by a custom element source.
     pub(crate) fn new_with_source(
         cx: &mut js::context::JSContext,
@@ -258,6 +268,21 @@ impl HTMLCollection {
             qualified_name,
         };
         HTMLCollection::create(cx, window, root, Box::new(filter))
+    }
+
+    pub(crate) fn all_elements_without_cx(
+        window: &Window,
+        root: &Node,
+        can_gc: CanGc,
+    ) -> DomRoot<HTMLCollection> {
+        #[derive(JSTraceable, MallocSizeOf)]
+        struct AllFilter;
+        impl CollectionFilter for AllFilter {
+            fn filter(&self, _elem: &Element, _root: &Node) -> bool {
+                true
+            }
+        }
+        HTMLCollection::create_without_cx(window, root, Box::new(AllFilter), can_gc)
     }
 
     fn match_element(elem: &Element, qualified_name: &LocalName) -> bool {
