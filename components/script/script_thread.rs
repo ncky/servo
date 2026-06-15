@@ -1260,18 +1260,30 @@ impl ScriptThread {
             // TODO: Perform pending transition operations from
             // https://drafts.csswg.org/css-view-transitions/#perform-pending-transition-operations.
 
+            // Servo's `Document::update_the_rendering` performs the reflow that
+            // produces the layout boxes used by IntersectionObserver. Run it
+            // before collecting intersection observations so newly attached
+            // observed targets are measured against current layout rather than
+            // stale or pre-layout zero-sized boxes.
+            //
+            // TODO: Split Servo's reflow/update step from final paint timing so
+            // this can match the HTML update-the-rendering ordering exactly.
+            let rendering_update = document.update_the_rendering();
+
             // > 19. For each doc of docs, run the update intersection observations steps for doc,
             // > passing in the relative high resolution time given now and
             // > doc's relevant global object as the timestamp. [INTERSECTIONOBSERVER]
             // TODO(stevennovaryo): The time attribute should be relative to the time origin of the global object
-            document
-                .update_intersection_observer_steps(CrossProcessInstant::now(), CanGc::from_cx(cx));
+            document.update_intersection_observer_steps(
+                CrossProcessInstant::now(),
+                CanGc::from_cx(cx),
+            );
 
             // TODO: Mark paint timing from https://w3c.github.io/paint-timing.
 
             // > Step 22: For each doc of docs, update the rendering or user interface of
             // > doc and its node navigable to reflect the current state.
-            if document.update_the_rendering().0.needs_frame() {
+            if rendering_update.0.needs_frame() {
                 painters_generating_frames.insert(document.webview_id().into());
             }
 
