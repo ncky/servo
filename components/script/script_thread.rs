@@ -615,6 +615,7 @@ impl ScriptThread {
     /// update timer has fired or the renderer has asked us for a new rendering update.
     pub(crate) fn set_needs_rendering_update(&self) {
         self.needs_rendering_update.store(true, Ordering::Relaxed);
+        self.schedule_update_the_rendering_timer_if_necessary(Duration::ZERO);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#navigate-to-a-javascript:-url>
